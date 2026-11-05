@@ -1,8 +1,8 @@
 [package]
-name = "wx-reader"
+name = "wenda-reader"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "一个方便在微信看书的小工具"
+authors = ["Wenda"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -18,10 +18,21 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["unstable", "tray-icon", "image-png", "image-ico"] }
 tauri-plugin-opener = "2"
+tauri-plugin-store = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+device_query = "4.0.1"
+tokio = { version = "1.53.3", features = ["time"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging"] }
+chrono = "0.4.45"
+tauri-plugin-dialog = "2.8.2"
+tauri-plugin-log = "2"
+log = "0.4"
+lazy_static = "1.5.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "wx-reader",
+  "productName": "wenda-reader",
   "version": "0.1.0",
-  "identifier": "com.wendasoft.wx-reader",
+  "identifier": "com.wendasoft.wenda-reader",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -10,13 +10,6 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "wx-reader",
-        "width": 800,
-        "height": 600
-      }
-    ],
     "security": {
       "csp": null
     }

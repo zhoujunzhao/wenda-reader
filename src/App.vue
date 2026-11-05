@@ -1,192 +1,276 @@
+<template>
+  <div class="tabs-container">
+    <n-tabs
+        v-model:value="activeTabId"
+        type="card"
+        tab-style="min-width: 80px;"
+        :addable="addable"
+        @close="closeTab"
+        :closable="true"
+        @update:value="changeTab"
+        @add="onTabAdded"
+        pane-class="tabs-pane"
+        size="small"
+        :center-active-tab="true"
+    >
+      <n-tab v-for="tab in tabs" :name="tab.id" :closable="tab.closable">
+        <n-popover trigger="hover" :arrow-point-to-center="true" :flip="true" placement="right">
+          <template #trigger>
+            {{ tab.title.length>=5 ? tab.title.substring(0, 5) + '...' : tab.title }}
+          </template>
+          <span>{{ tab.title }}</span>
+        </n-popover>
+
+      </n-tab>
+    </n-tabs>
+    <div class="other-container">
+      <div class="address-container">
+        <n-input v-model:value="activeUrl" placeholder="请输入网址" class="address-input" size="small" :disabled="addressDisabled" />
+        <n-button size="small" @click="gotoNewUrl" :disabled="addressDisabled">Go</n-button>
+      </div>
+      <div class="style-container" v-show="widthModeShow">
+          <n-radio
+              :checked="widthValue === 'default'"
+              value="default"
+              label="默认"
+              name="reader-width"
+              @change="onWidthChange"
+          />
+          <n-radio
+              :checked="widthValue ==='70%'"
+              value="70%"
+              label="70%"
+              name="reader-width"
+              @change="onWidthChange"
+          />
+          <n-radio
+              :checked="widthValue === '95%'"
+              value="95%"
+              label="95%"
+              name="reader-width"
+              @change="onWidthChange"
+          />
+      </div>
+    </div>
+  </div>
+</template>
+
 <script setup lang="ts">
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import {onMounted, onUnmounted, ref, watch} from "vue"
+import {listen} from "@tauri-apps/api/event";
+import {invoke} from "@tauri-apps/api/core";
 
-const greetMsg = ref("");
-const name = ref("");
+const ID_FIRST_PAGE_ID: string = "tab-main";
 
-const tabs = ref([
-  { id: 'tab-home', title: '微信爱读书', url: 'https://weread.qq.com/' }
-]);
-const activeTabId = ref('tab-home');
+interface Tab {
+  id: string,
+  title: string,
+  url: string,
+  closable: boolean,
+  isShow: boolean,
+}
 
-const createNewTab = (url: string, title: string) => {
-  const uniqueId = `tab-reader-${Date.now()}`;
-  tabs.value.push({ id: uniqueId, title: title || '阅读书籍', url });
-  activeTabId.value = uniqueId;
+const tabs = ref<Tab[]>([]);
+const activeTabId = ref<string>();
+const activeUrl = ref<string>();
+const addable = ref<boolean>(true);
+const addressDisabled = ref<boolean>(false);
+const widthValue = ref<string>("default");
+const widthModeShow = ref<boolean>(false);
+
+
+const onWidthChange = (e: Event) => {
+  const val = (e.target as HTMLInputElement).value;
+  widthValue.value = val;
+  sendActionToBackend('changeWidthMode', { "tabId": activeTabId.value, "mode":val });
 };
 
-const switchTab = (id: string) => { activeTabId.value = id; };
+const doWidthValue = (data:any) =>{
+  if(data.tabId === activeTabId.value) {
+    widthValue.value = data.mode;
+  }
+};
+
+watch(activeUrl, () => {
+  widthModeShow.value = activeUrl.value?.includes("weread.qq.com/web/reader") || false;
+});
+
+const gotoNewUrl = () => {
+  if(!activeUrl.value) return;
+  const index = tabs.value.findIndex(t => t.id === activeTabId.value);
+
+  if (index >= 0) {
+    tabs.value[index].url = activeUrl.value;
+  }
+  sendActionToBackend('openNewUrl', { "tabId": activeTabId.value, "url": activeUrl.value });
+}
+
+const onTabAdded = () =>{
+  sendActionToBackend('addVoidTab', { });
+}
+
+
+const addTab = (tab: Tab) => {
+  tabs.value.push(tab);
+  if (tab.isShow) {
+    activeTabId.value = tab.id;
+    activeUrl.value = tabs.value.find(t => t.id === activeTabId.value)?.url;
+    addressDisabled.value = tab.id === ID_FIRST_PAGE_ID;
+  }
+}
+
+const changeTab = () => {
+  sendActionToBackend('tabSelected', { "tabId": activeTabId.value });
+  activeUrl.value = tabs.value.find(t => t.id === activeTabId.value)?.url;
+
+  addressDisabled.value = activeTabId.value === ID_FIRST_PAGE_ID;
+}
+
 
 const closeTab = (id: string) => {
   const index = tabs.value.findIndex(t => t.id === id);
   if (index === -1) return;
   tabs.value.splice(index, 1);
   if (activeTabId.value === id && tabs.value.length > 0) {
-    activeTabId.value = tabs.value[Math.max(0, index - 1)].id;
+    const tab = tabs.value[Math.max(0, index - 1)];
+    activeTabId.value = tab.id;
+    activeUrl.value = tab.url;
+  }
+  sendActionToBackend('tabClosed', { "closeTabId": id, "activeTabId": activeTabId.value });
+};
+
+const selectTab = (data: any) => {
+  if(data.id === activeTabId.value){
+    return;
+  }
+  const index = tabs.value.findIndex(t => t.id === data.id);
+  if (index >= 0) {
+    activeTabId.value = tabs.value[index].id;
+    activeUrl.value = tabs.value[index].url;
+    sendActionToBackend('tabSelected', { "tabId": activeTabId.value });
   }
 };
 
-// 转换网络路径到主进程的透明代理协议
-const convertToProxyUrl = (url: string) => {
-  return url.replace("https://", "weread-proxy://localhost/");
-};
-
-// 核心：拦截并劫持 iframe 内部超链接点击和单页路由变化
-const injectIframeIntercepter = (event: any, tabId: any) => {
-  try {
-    const iframeWin = event.target.contentWindow;
-    const iframeDoc = event.target.contentDocument || iframeWin.document;
-
-    // 1. 劫持内部 A 标签点击
-    iframeDoc.addEventListener('click', (e: { target: { closest: (arg0: string) => any; }; preventDefault: () => void; }) => {
-      let target = e.target.closest('a');
-      if (target && target.href) {
-        const rawUrl = target.href.replace("weread-proxy://localhost/", "https://");
-        if (rawUrl.includes('://qq.com')) {
-          e.preventDefault();
-          createNewTab(rawUrl, target.innerText.trim());
-        }
-      }
-    }, true);
-
-    // 2. 劫持内部 window.open
-    iframeWin.open = (url: string) => {
-      if (url) {
-        const rawUrl = url.replace("weread-proxy://localhost/", "https://");
-        createNewTab(rawUrl, '新标签页');
-      }
-      return null;
-    };
-
-    // 3. 监听内部 SPA 路由的改变（检测看书动作）
-    let lastUrl = iframeWin.location.href;
-    setInterval(() => {
-      if (iframeWin.location.href !== lastUrl) {
-        const oldUrl = lastUrl;
-        lastUrl = iframeWin.location.href;
-        if (lastUrl.includes('/web/reader/') && !oldUrl.includes('/web/reader/')) {
-          const rawUrl = lastUrl.replace("weread-proxy://localhost/", "https://");
-          iframeWin.history.replaceState(null, '', oldUrl); // 原位保留
-          createNewTab(rawUrl, '读书中...');
-        }
-      }
-    }, 400);
-
-  } catch (err) {
-    console.warn("跨域拦截前置触发（加载中）");
+const modifyTabTitle = (tabData:any) => {
+  const { tabId, title } = tabData;
+  const tab = tabs.value.find(t => t.id === tabId);
+  if (tab) {
+    tab.title = title;
   }
 };
 
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
+const modifyTabUrl = (tabData:any) => {
+  const { tabId, url } = tabData;
+  const tab = tabs.value.find(t => t.id === tabId);
+  if (tab) {
+    tab.url = url;
+  }
+  if(activeTabId.value == tabId){
+    activeUrl.value = url;
+  }
+};
+
+const isAddTab = (data:any) => {
+  addable.value = data.isAdd;
+};
+
+/**
+ * 通过后端全局显示提示信息
+ * @param title
+ * @param message
+ */
+// const alert = (title: string, message: string) => {
+//   sendActionToBackend('alertShow', { "title": title, "message": message });
+// };
+
+
+// region 与后端交互
+
+const actionDispatcher = {
+  addTab,
+  closeTab,
+  modifyTabTitle,
+  selectTab,
+  isAddTab,
+  modifyTabUrl,
+  doWidthValue,
+};
+
+interface BackendActionPayload {
+  action: string;
+  data: any; // 这里的 data 也可以根据具体业务进一步细化
 }
+
+const sendActionToBackend = async (action: string, data: any) => {
+  await invoke('receive_front_action', { "action": action, "data": data });
+};
+
+let unlistenFn: (() => void) | null = null;
+let idx:number = 1
+onMounted(async () => {
+  try {
+    console.warn(`ini调用成功`);
+    unlistenFn = await listen<BackendActionPayload>('tab-container-action', (event) => {
+      const { action, data } = event.payload;
+      console.warn(`调用成功:${idx}: ${event.payload}`);
+      idx++;
+      if (action && action in actionDispatcher) {
+        const key = action as keyof typeof actionDispatcher;
+        actionDispatcher[key](data);
+      } else {
+        console.warn(`未找到后端指定的 Action 处理方法: ${action}`);
+      }
+    });
+    await sendActionToBackend('beReady', { info: "yes" });
+  } catch (error) {
+    console.error("监听器注册失败:", error);
+  }
+});
+
+onUnmounted(() => {
+  if (unlistenFn) unlistenFn();
+});
+
+// endregion 与后端交互
+
 </script>
 
-<template>
-  <div class="app-container">
-    <!-- 顶部自定义导航操作区 (45px 严格限制) -->
-    <div class="tab-bar-wrapper" data-tauri-drag-region>
-
-      <!-- 左侧：多标签页卡片 -->
-      <div class="tabs-scroll-area" @mousedown.stop>
-        <div
-            v-for="tab in tabs"
-            :key="tab.id"
-            class="tab-item"
-            :class="{ 'active': activeTabId === tab.id }"
-            @click="switchTab(tab.id)"
-        >
-          <span class="tab-title">{{ tab.title }}</span>
-          <span
-              v-if="tabs.length > 1"
-              class="tab-close-btn"
-              @click.stop="closeTab(tab.id)"
-          >✕</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- 底部微信读书多视窗隔离容器 (Vue 完全接管，不再遭遇 Rust 内核死锁) -->
-    <div class="webview-container-host">
-      <iframe
-          v-for="tab in tabs"
-          :key="tab.id"
-          v-show="activeTabId === tab.id"
-          :src="convertToProxyUrl(tab.url)"
-          class="book-iframe-bridge"
-          @load="injectIframeIntercepter($event, tab.id)"
-      ></iframe>
-    </div>
-  </div>
-</template>
-
 <style scoped>
-.app-container {
+html body{
+  overflow: hidden;
+}
+
+.tabs-container {
   display: flex;
   flex-direction: column;
-  width: auto;
-  height: auto;
+  width: 99vw;
+  height: 99vh;
   background-color: #f6f7f9;
   overflow: hidden;
   user-select: none;
 }
 
-.tab-bar-wrapper {
+.other-container{
   display: flex;
-  align-items: center;
-  height: 45px;
-  background-color: #ffffff;
-  border-bottom: 1px solid #e3e5e7;
-  padding-left: 12px;
-  padding-right: 0;
-  box-sizing: border-box;
+  flex-direction: row;
+  width: 99vw;
+  height: 30px;
+  background-color: #f6f7f9;
+  overflow: hidden;
+  user-select: none;
 }
 
-.tabs-scroll-area {
-  display: flex;
-  gap: 6px;
-  overflow-x: auto;
-  max-width: 65%;
-  align-items: center;
-  height: 100%;
+.address-container{
+  width: 60vw;
 }
 
-.tabs-scroll-area::-webkit-scrollbar { display: none; }
-
-.tab-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 14px;
-  height: 32px;
-  background-color: #f1f2f3;
-  border-radius: 6px;
-  font-size: 13px;
-  color: #61666d;
-  cursor: pointer;
-  white-space: nowrap;
-  max-width: 150px;
+.style-container{
+  text-align: right;
+  width: 40vw;
 }
 
-.tab-item.active { background-color: #007aff; color: #ffffff; }
-
-.tab-close-btn { font-size: 10px; padding: 2px; border-radius: 50%; }
-.tab-close-btn:hover { background-color: rgba(0, 0, 0, 0.15); }
-
-/* 底部网页沙箱宿主容器 */
-.webview-container-host {
-  flex: 1;
-  width: 100%;
-  height: calc(100vh - 45px);
-  background-color: #ffffff;
-}
-
-.book-iframe-bridge {
-  width: 100%;
-  height: 100%;
-  border: none;
-  outline: none;
+.address-input{
+  width:600px;
+  margin-left: 5px;
 }
 </style>
