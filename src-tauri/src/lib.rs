@@ -2,22 +2,24 @@ use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::str::FromStr;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Webview, WebviewUrl, Window, Wry};
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Webview, WebviewUrl, Window, Wry, async_runtime::JoinHandle, RunEvent};
+use tauri::webview::PageLoadEvent;
 
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_store::{Store, StoreExt};
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetWindow, WindowFromPoint, GA_ROOT, GW_OWNER, GetWindowThreadProcessId, GetClassNameW, GUITHREADINFO, GetGUIThreadInfo};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetWindow, WindowFromPoint, GA_ROOT, GW_OWNER, GetWindowThreadProcessId, GetClassNameW};
 
 use chrono::{Utc};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tauri::webview::PageLoadEvent;
+use serde_json::{json};
+
 
 // 定义常数（基于逻辑像素）
 const HIDE_REMAIN: f64 = 1.0; // 隐藏时留下的边缘高度
@@ -39,6 +41,30 @@ const ID_TOP_VIEW: &str = "top-view";
 
 const WINDOW_TITLE : &str = "偷偷读";
 
+const SETTING_PAGE_URL:&str = "/setting";
+
+#[derive(Default)]
+pub struct TaskRegistry(pub Mutex<Vec<JoinHandle<()>>>);
+
+impl TaskRegistry {
+    // 注册单个异步任务句柄
+    pub fn add(&self, handle: JoinHandle<()>) {
+        if let Ok(mut list) = self.0.lock() {
+            list.push(handle);
+        }
+    }
+
+    // 批量中止所有任务
+    pub fn abort_all(&self) {
+        if let Ok(mut list) = self.0.lock() {
+            for handle in list.drain(..) {
+                handle.abort();
+            }
+            log::info!("所有后台异步任务已全部终止");
+        }
+    }
+}
+
 /// 边条窗体位置
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 enum SidePosition {
@@ -46,6 +72,22 @@ enum SidePosition {
     #[default]
     TopCenter,TopRight
     ,Left,Right
+}
+
+impl FromStr for SidePosition {
+    type Err = String; // 转换失败时的错误类型
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // 建议统一转小写匹配，增强容错性
+        match s.trim().to_lowercase().as_str() {
+            "topleft" => Ok(SidePosition::TopLeft),
+            "topcenter" => Ok(SidePosition::TopCenter),
+            "topright" => Ok(SidePosition::TopRight),
+            "left" => Ok(SidePosition::Left),
+            "right" => Ok(SidePosition::Right),
+            _ => Err(format!("未知的隐藏边条位置: {}", s)),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -145,16 +187,11 @@ impl AppGlobalState {
         self.inner.lock().unwrap().open_tabs.len() as i32
     }
 
-    fn set_open_tabs_add(&self, tab_id: &str, tab: Tab){
+    fn set_open_tabs_add(&self, tab_id: &str, tab: Tab, _is_update:bool){
         let mut inner = self.inner.lock().unwrap();
         let tabs = &mut inner.open_tabs;
         tabs.entry(tab_id.parse().unwrap()).and_modify(|e| *e = tab.clone()).or_insert(tab.clone());
-        inner.is_update = true;
-    }
-
-    #[allow(dead_code)]
-    fn set_open_tabs_add_new(&self, key: &str, tab_id: &str, title: &str,url: &str,closable: bool, reader_mode: &str){
-        self.set_open_tabs_add(key, Tab::new(tab_id, title, url, closable, reader_mode));
+        inner.is_update = _is_update;
     }
 
     fn set_open_tabs_modify_val(&self, tab_id: &str, attr_name: TabAttrName, val:serde_json::Value){
@@ -166,7 +203,7 @@ impl AppGlobalState {
                 TabAttrName::Closable => tab.closable = serde_json::from_value(val).unwrap(),
                 TabAttrName::ReaderMode => tab.reader_mode = serde_json::from_value(val).unwrap(),
             }
-            self.set_open_tabs_add(tab_id, tab);
+            self.set_open_tabs_add(tab_id, tab, true);
         }
     }
 
@@ -322,6 +359,7 @@ pub fn run() {
                 .center()
                 .maximizable(false)
                 .minimizable(false)
+                .decorations(true)
                 .closable(false)
                 .skip_taskbar(true)
                 .build()
@@ -376,14 +414,13 @@ pub fn run() {
                 .auto_resize()
                 .on_navigation(move |url: &tauri::Url| {
                     let (state, tab_id) = is_open_new_tab(&_window, url.to_string());
-                    log::info!("open state:{}",state);
                     return if state == 0 {
                         // 表示在当前webview打开
                         true
                     } else if state == 1 {
                         // 表示在新标签面打开，同时阻断当前webview打开
                         let tab = Tab::new("", "加载中", url.as_str(), true, "default");
-                        add_tab(&_window, tab, false);
+                        add_tab(&_window, tab, false,false);
                         let _win = _window.clone();
                         send_is_tab_add(_win, -1);
                         false
@@ -479,7 +516,7 @@ pub fn run() {
                         }
                     "#)
                     .on_document_title_changed(|webview, title| {
-                        if title.is_empty() || title == BLANK_PAGE {
+                        if title.is_empty() || title == BLANK_PAGE || webview.url().unwrap().to_string().ends_with(SETTING_PAGE_URL){
                             return;
                         }
 
@@ -522,7 +559,7 @@ pub fn run() {
                                     let mode = tab.reader_mode;
                                     let js_code = format!("update_wenda_style('{}');", mode);
                                     webview.eval(&js_code).expect("js 方法update_wenda_style执行失败");
-                                    log::info!("js 方法update_wenda_style 执行成功，mode:{}", mode);
+                                    // log::info!("js 方法update_wenda_style 执行成功，mode:{}", mode);
                                 }
                             }
 
@@ -552,8 +589,10 @@ pub fn run() {
 
             let tab_app_handle = app_handle.clone();
 
+            let registry = TaskRegistry::default();
+
             // 异步写入历史访问记录
-            tauri::async_runtime::spawn(async move {
+            let task_write_config = tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 loop {
                     let _app_store = tab_app_handle.state::<AppGlobalState>();
@@ -580,12 +619,14 @@ pub fn run() {
                 }
             });
 
+            registry.add(task_write_config);
+
             #[cfg(target_os = "windows")]
             let hwnd_main_raw = main_window.hwnd().unwrap().0 as isize;
             let hwnd_side_raw = side_window.hwnd().unwrap().0 as isize;
 
             // 开启纯 Rust 的后台异步轮询线程
-            tauri::async_runtime::spawn(async move {
+            let task_window_position = tauri::async_runtime::spawn(async move {
                 loop {
                     if !main_window.is_always_on_top().unwrap() {
                         main_window.set_always_on_top(true).unwrap();
@@ -615,15 +656,26 @@ pub fn run() {
                 }
             });
 
+            registry.add(task_window_position);
+
+            app.manage(registry);
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_log::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![receive_front_action])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .invoke_handler(tauri::generate_handler![receive_front_top_action,receive_front_setting_action])
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            if let RunEvent::ExitRequested { .. } = event {
+                if let Some(registry) = app_handle.try_state::<TaskRegistry>() {
+                    registry.abort_all();
+                }
+            }
+        });
 }
 
 fn alert_show(window: Window, title: &str, message: &str) {
@@ -682,21 +734,21 @@ fn get_screen_size(app: AppHandle) -> (f64, f64) {
 }
 
 // region tab操作
-fn add_tab(window: &Window, mut tab: Tab, is_show: bool) {
-
+///
+/// is_init: 是否是初始化时添加的标签页,true:初始化时添加，false:非初始化时添加
+fn add_tab(window: &Window, mut tab: Tab, is_show: bool,is_init:bool) {
     let (tab_id, webview) = get_idle_webview(window, tab.id.clone());
     if !tab_id.is_empty() && webview.is_some() {
         tab.id = tab_id;
         webview.unwrap().navigate(tab.url.parse().unwrap()).unwrap();
         let _tab = tab.clone();
         let state = window.app_handle().state::<AppGlobalState>();
-        state.set_open_tabs_add(&*_tab.id, _tab.clone());
+        state.set_open_tabs_add(&*_tab.id, _tab.clone(), !is_init);
 
         let _tab_id = tab.id.clone();
         if is_show{
             switch_webview(window.clone(), "".parse().unwrap(), _tab_id, false);
         }
-
         // 添加前端标签
         let mut payload = json!(tab);
         payload["isShow"] = json!(is_show);
@@ -719,6 +771,10 @@ fn send_is_tab_add(window: Window,mut tabs_size:i32) {
 }
 // endregion tab操作
 
+// region 前端动作处理
+
+// region TopView前端动作处理
+
 fn send_action_to_top_view(window: &Window, event_name: &str, data: serde_json::Value) {
     let payload = json!({
         "action": event_name,
@@ -730,17 +786,19 @@ fn send_action_to_top_view(window: &Window, event_name: &str, data: serde_json::
 
     window
         .app_handle()
-        .emit_to(ID_TOP_VIEW, "tab-container-action", payload)
+        .emit_to(ID_TOP_VIEW, "top-view-action", payload)
         .unwrap();
 }
 
-// region 前端动作处理
+///
+/// 接收前端TopView动作
 #[tauri::command(async)]
-fn receive_front_action(window: Window, action: String, data: serde_json::Value) {
+fn receive_front_top_action(window: Window, action: String, data: serde_json::Value) {
 
     match action.as_str() {
+
         "beReady" => {
-            do_ready_notify(window, serde_json::to_string(&data).unwrap());
+            do_ready_notify(window);
         }
         "tabSelected" => {
             let tab_id = data.get("tabId").unwrap().as_str().unwrap().to_string();
@@ -774,8 +832,56 @@ fn receive_front_action(window: Window, action: String, data: serde_json::Value)
             let mode = data.get("mode").unwrap().as_str().unwrap();
             do_change_width_mode(window, tab_id, mode);
         }
+        "openSetting" =>{
+            do_open_setting(window);
+        }
+
         _ => {}
     }
+}
+
+///
+/// 打开设置页面，并且只能打开一个
+fn do_open_setting(window: Window) {
+    let app_store = window.app_handle().state::<AppGlobalState>();
+    let tabs_size = app_store.get_open_tabs_count();
+    if tabs_size >= MAX_TAB_COUNT as i32 {
+        alert_show(window, "提示", "标签页数量达到最大值，无法打开设置页面");
+        return;
+    }
+    let tabs = app_store.get_open_tabs();
+    let tab = tabs.values().find(|tab| tab.url.ends_with(SETTING_PAGE_URL));
+    if let Some(tab) = tab {
+        let payload = json!({
+                            "id": tab.id
+                        });
+        send_action_to_top_view(&window, "selectTab", payload);
+        return;
+    }
+    log::info!("打开设置页面");
+    let url = get_all_route_url(window.clone(), SETTING_PAGE_URL);
+    if url.is_empty() {
+        log::info!("获取设置页面 Url 失败，不能为空");
+        return;
+    }
+    add_tab(&window, Tab::new("", "设置", &*url, true, ""), true, false);
+}
+
+fn get_all_route_url(window: Window, sub_url: &str) -> String {
+
+    if let Some(webview) = window.get_webview(ID_TOP_VIEW) {
+        // 2. 获取当前窗口的完整 Url 对象
+        log::info!("获取当前窗口的完整 Url 对象{}", webview.url().unwrap().to_string());
+        if let Ok(mut current_url) = webview.url() {
+            // 3. 设置哈希路由路径（注意：set_fragment 不需要加 '#' 号）
+            current_url.set_fragment(Some(sub_url));
+            let url = current_url.to_string();
+            return url;
+
+        }
+    }
+    return "".to_string();
+
 }
 
 fn do_add_void_tab(window: Window) {
@@ -790,7 +896,7 @@ fn do_add_void_tab(window: Window) {
         alert_show(window, "提示", "无法添加新标签页,请重试。");
         return;
     }
-    add_tab(&window, Tab::new(&*tab_id, "新页", BLANK_PAGE, true, ""), true);
+    add_tab(&window, Tab::new(&*tab_id, "新页", BLANK_PAGE, true, ""), true, false);
     send_is_tab_add(window.clone(), -1);
 }
 
@@ -802,7 +908,7 @@ fn do_open_new_url(window: Window,tab_id:String, url: String) {
     }
 }
 
-fn do_ready_notify(window: Window, info: String) {
+fn do_ready_notify(window: Window) {
 
     let payload = json!({
         "id": ID_FIRST_PAGE_ID,
@@ -836,7 +942,7 @@ fn do_ready_notify(window: Window, info: String) {
                 if list.contains(&val.url){
                     continue;
                 }
-                add_tab(&window, val.clone(), false);
+                add_tab(&window, val.clone(), false,true);
                 list.push(val.clone().url);
                 i += 1;
             }
@@ -893,6 +999,88 @@ fn do_tab_closed(window: Window, close_tab_id: String, active_tab_id: String) {
         send_is_tab_add(_win, -1);
     });
 }
+
+// endregion TopView前端动作处理
+
+// region Setting前端动作处理
+
+fn send_action_to_setting_view(window: &Window, event_name: &str, data: serde_json::Value) {
+    let payload = json!({
+        "action": event_name,
+        "data": data
+    });
+
+    let app_store = window.app_handle().state::<AppGlobalState>();
+    let tabs = app_store.get_open_tabs();
+    let tab = tabs.values().find(|tab| tab.url.ends_with(SETTING_PAGE_URL));
+    if let Some(tab) = tab {
+        window
+            .app_handle()
+            .emit_to(tab.id.clone(), "setting-view-action", payload)
+            .unwrap();
+
+    }
+
+
+}
+
+/*
+ * 接收前端Setting动作
+ */
+#[tauri::command(async)]
+fn receive_front_setting_action(window: Window, action: String, data: serde_json::Value) {
+    match action.as_str() {
+
+        "beSettingReady" => {
+            do_setting_ready_notify(window);
+        }
+        "setSidePosition" => {
+            let side_position = data.get("sidePosition").unwrap().as_str().unwrap();
+            do_set_new_side_position(window, side_position);
+        }
+
+        _ => {}
+    }
+}
+
+/**
+ * 设置页面就绪通知
+*/
+fn do_setting_ready_notify(setting_window: Window) {
+
+    let mut payload = json!({});
+
+    let store = get_config_store(setting_window.app_handle());
+
+    // 读取配置
+    if let Some(val) = store.get("sidePosition") {
+        payload["sidePosition"] = val.clone();
+    }
+
+    send_action_to_setting_view(&setting_window, "onSettingLoad", payload);
+}
+
+/**
+* 设置窗体隐藏位置
+ */
+fn do_set_new_side_position(window: Window, side_position: &str) {
+    if side_position.is_empty() {
+        return;
+    }
+    log::info!("设置窗体隐藏位置:{}", side_position);
+    if let Ok(_side_position) = SidePosition::from_str(side_position) {
+        let app_store = window.app_handle().state::<AppGlobalState>();
+        app_store.set_side_position(_side_position.clone());
+        let side_window = window.clone().app_handle().get_window("side_window").unwrap();
+        let (screen_width, screen_height) = get_screen_size(window.app_handle().clone());
+        set_side_position(&side_window, _side_position, screen_width, screen_height);
+    }
+    else {
+        log::warn!("设置窗体隐藏位置失败，无效的位置：{}", side_position);
+    }
+
+}
+// endregion Setting前端动作处理
 
 
 // endregion 前端动作处理
