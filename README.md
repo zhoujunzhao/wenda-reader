@@ -34,4 +34,5 @@
 
 
 #### 记录 
-1、在 src-tauri 文件夹中运行 cargo update 将获取所有依赖项的最新可用语义兼容版本。 
+1、在 src-tauri 文件夹中运行 cargo update 将获取所有依赖项的最新可用语义兼容版本。   
+2、建立图标 bun run tauri icon WendaReader.png  
