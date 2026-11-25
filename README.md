@@ -20,14 +20,16 @@
   bun install  
 
 #### 开发测试运行
-  bun run tauri dev  
+  bun run tauri dev
+
 
 #### 为所有平台打包
   bun run tauri build  
 
 #### 只为 Windows 打包
 ##### 如果不需要任何安装包，只想得到一个可直接运行的绿色 .exe 文件，使用 --no-bundle 跳过所有打包步骤。
-  bun run tauri build --target x86_64-pc-windows-msvc --no-bundle 
+  bun run tauri build --target x86_64-pc-windows-msvc --no-bundle
+
 
 
 #### 记录 

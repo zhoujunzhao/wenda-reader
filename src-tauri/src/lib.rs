@@ -25,6 +25,8 @@ use serde_json::{json};
 const HIDE_REMAIN: f64 = 1.0; // 隐藏时留下的边缘高度
 const TOP_VIEW_HEIGHT: f64 = 70.0; // 顶部视图高度
 const CONFIG_FILE_NAME: &str = "settings.json"; // 配置文件名
+const WECHAT_READER_DOMAIN: &str = "://qq.com"; // 用于判断是否为微信读书域名
+const SCROLL_TITLE_PREFIX: &str = "__WENDA_SCROLL__:"; // 内部传递滚动坐标的临时标记
 
 const MAX_TAB_COUNT: u32 = 9; // 最大标签页数 9为数之极
 
@@ -96,6 +98,7 @@ enum TabAttrName{
     Url,
     Closable,
     ReaderMode,
+    ScrollPos,
 }
 
 // region 结构声明
@@ -106,6 +109,10 @@ struct Tab {
     url: String,
     closable: bool,
     reader_mode: String, // 阅读宽度模式，只能微信读书有效。
+    #[serde(default)]
+    scroll_top: f64, // 新增：滚动条纵向位置（仅非微信读书网页有效）
+    #[serde(default)]
+    scroll_selector: String, // 新增：局部滚动容器选择器
 }
 
 impl Tab {
@@ -116,6 +123,8 @@ impl Tab {
             url: _url.to_string(),
             closable: _closable,
             reader_mode: if _reader_mode.is_empty() { "default".to_string() } else {_reader_mode.to_string()},
+            scroll_top: 0.0,
+            scroll_selector: String::new(),
         }
     }
 }
@@ -202,6 +211,15 @@ impl AppGlobalState {
                 TabAttrName::Url => tab.url = serde_json::from_value(val).unwrap(),
                 TabAttrName::Closable => tab.closable = serde_json::from_value(val).unwrap(),
                 TabAttrName::ReaderMode => tab.reader_mode = serde_json::from_value(val).unwrap(),
+                TabAttrName::ScrollPos => {
+                    if let (Some(top), Some(selector)) = (
+                        val.get("top").and_then(|v| v.as_f64()),
+                        val.get("selector").and_then(|v| v.as_str()),
+                    ) {
+                        tab.scroll_top = top;
+                        tab.scroll_selector = selector.to_string();
+                    }
+                },
             }
             self.set_open_tabs_add(tab_id, tab, true);
         }
@@ -230,8 +248,8 @@ impl AppGlobalState {
     fn set_side_position(&self, side_position: SidePosition) {
         let mut inner = self.inner.lock().unwrap();
         inner.side_position = side_position;
-        inner.is_update = true;
     }
+
     fn get_is_update(&self) -> bool{
         self.inner.lock().unwrap().is_update
     }
@@ -266,7 +284,6 @@ pub fn run() {
             let app_store = app_handle.state::<AppGlobalState>();
 
             if let Ok(local_data_dir) = app_handle.path().app_local_data_dir() {
-                log::info!("应用本地数据存储根目录: {:?}", local_data_dir);
                 app_store.set_config_file_path(&*local_data_dir
                     .join("config")
                     .join(CONFIG_FILE_NAME)
@@ -274,6 +291,7 @@ pub fn run() {
                     .unwrap()
                 );
             }
+
             let _app = app_handle.clone();
 
             let (screen_width, screen_height) = get_screen_size(_app);
@@ -330,6 +348,15 @@ pub fn run() {
                             }
                         }
                         "tray-quit" => {
+                            for i in 1..=MAX_TAB_COUNT {
+                                if let Some(webview) = app_handle.get_webview(&get_tab_id(i)) {
+                                    capture_webview_scroll(&webview);
+                                }
+                            }
+                            std::thread::sleep(Duration::from_millis(150));
+
+                            flush_config_to_disk(app_handle);
+
                             if let Some(_) = app_handle.tray_by_id("tray-menu") {
                                 let _ = app_handle.remove_tray_by_id("tray-menu");
                             }
@@ -431,7 +458,6 @@ pub fn run() {
                 .devtools(true)
                 .auto_resize()
                 .on_navigation(move |url: &tauri::Url| {
-                    log::info!("on_navigation: {}", url);
                     let (state, tab_id) = is_open_new_tab(&_window, url.to_string());
                     return if state == 0 {
                         // 表示在当前webview打开
@@ -454,7 +480,6 @@ pub fn run() {
                     };
                 })
                 .on_new_window(move |new_url, _features| {
-                    log::info!("New window requested: {}", new_url);
                     if let Some(web_view) = _window2.get_webview(ID_FIRST_PAGE_ID){
                         web_view.navigate(new_url.clone()).unwrap();
                         let payload = json!({
@@ -484,86 +509,54 @@ pub fn run() {
                         WebviewUrl::External(BLANK_PAGE.parse().unwrap()),
                     )
                     .devtools(true)
-                    .initialization_script(r#"
-                        function register_css() {
-                          if (document.getElementById("wenda-reader-style")) {
-                            return;
-                          }
-                          const oStyle = document.createElement("style");
-                          oStyle.id = "wenda-reader-style";
-                          oStyle.textContent = `
-                                :root {
-                                    --wendaread-width: 70%;
+                    .initialization_script(include_str!("../scripts/wenda_reader.js"))
+                        .on_document_title_changed(|webview, title| {
+                            // 1. 拦截内部滚动坐标回传标记（优先处理，不触发任何其他 Webview 查询）
+                            if let Some(payload_str) = title.strip_prefix(SCROLL_TITLE_PREFIX) {
+                                if let Ok(scroll_val) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                                    let state = webview.app_handle().state::<AppGlobalState>();
+                                    state.set_open_tabs_modify_val(
+                                        webview.label(),
+                                        crate::TabAttrName::ScrollPos,
+                                        scroll_val,
+                                    );
                                 }
-
-                                html.wenda-reader-mode .readerContent {
-                                    width: calc(100vw - 15px) !important;
-                                    max-width: calc(100vw - 15px) !important;
-                                    min-height: 100vh !important;
-                                    margin: 0 !important;
-                                    overflow-x: hidden !important;
-                                }
-
-                                html.wenda-reader-mode .app_content {
-                                    width: var(--wendaread-width) !important;
-                                    max-width: var(--wendaread-width) !important;
-                                    margin-left: auto !important;
-                                    margin-right: auto !important;
-                                    min-height: 100vh !important;
-                                    overflow-x: hidden !important;
-                                }
-
-                                html.wenda-reader-mode .readerTopBar {
-                                    max-width: var(--wendaread-width) !important;
-                                }
-
-                                html.wenda-reader-mode .readerControls {
-                                    left: auto !important;
-                                    right: 0 !important;
-                                }
-                            `;
-                            document.head.appendChild(oStyle);
-                        }
-                        let preMode="";
-                        function update_wenda_style(mode) {
-                          register_css();
-                          if(!mode){
-                            mode === "default"
-                          }
-                          if(mode === preMode) return;
-
-                          if(mode === "default"){
-                            if (document.documentElement.classList.contains("wenda-reader-mode")) {
-                              document.documentElement.classList.remove("wenda-reader-mode");
+                                return;
                             }
-                          }
-                          else {
-                            document.documentElement.style.setProperty("--wendaread-width", mode);
-                            document.documentElement.classList.add("wenda-reader-mode");
-                          }
-                          preMode=mode;
-                          window.dispatchEvent(new Event('resize'));
 
-                        }
-                    "#)
-                    .on_document_title_changed(|webview, title| {
-                        if title.is_empty() || title == BLANK_PAGE || webview.url().unwrap().to_string().ends_with(SETTING_PAGE_URL){
-                            return;
-                        }
+                            if title.is_empty() || title == BLANK_PAGE {
+                                return;
+                            }
 
-                        let payload = json!({
-                            "tabId": webview.label(),
+                            // 安全获取 URL，避免 COM 回调重入或返回 Err 时 unwrap 崩溃
+                            if let Ok(current_url) = webview.url() {
+                                if current_url.as_str().ends_with(SETTING_PAGE_URL) {
+                                    return;
+                                }
+                            }
+
+                            let label = webview.label().to_string();
+                            let app_handle = webview.app_handle().clone();
+
+                            let payload = json!({
+                            "tabId": label,
                             "title": title,
                         });
-                        let window = webview.window();
-                        send_action_to_top_view(&window, "modifyTabTitle", payload);
-                        let tab_window = webview.window();
 
-                        let state = tab_window.app_handle().state::<AppGlobalState>();
-                        state.set_open_tabs_modify_val(webview.label(), crate::TabAttrName::Title, serde_json::Value::String(title.clone()));
-                        modify_window_title(window, webview.label(), &*title);
-                    })
-                    .on_navigation(move |url: &tauri::Url| {
+                            let state = app_handle.state::<AppGlobalState>();
+                            state.set_open_tabs_modify_val(
+                                &label,
+                                crate::TabAttrName::Title,
+                                serde_json::Value::String(title.clone()),
+                            );
+
+                            if let Some(window) = app_handle.get_window("main") {
+                                send_action_to_top_view(&window, "modifyTabTitle", payload);
+                                modify_window_title(window, &label, &title);
+                            }
+                        })
+
+                        .on_navigation(move |url: &tauri::Url| {
                         let _win = _window.clone();
                         log::info!("dao：{}",url);
                         let _url = url.as_str();
@@ -574,6 +567,13 @@ pub fn run() {
                             if tab_url.to_lowercase() != _url.to_lowercase() {
                                 log::info!("url发生了变化：{} -> {}", tab_url, _url);
                                 state.set_open_tabs_modify_val(&label_for_closure, crate::TabAttrName::Url, serde_json::Value::String(_url.parse().unwrap()));
+
+                                state.set_open_tabs_modify_val(
+                                    &label_for_closure,
+                                    crate::TabAttrName::ScrollPos,
+                                    json!({ "top": 0.0, "selector": "" }),
+                                );
+
                                 let payload = json!({
                                     "tabId": label_for_closure,
                                     "url": _url,
@@ -585,12 +585,37 @@ pub fn run() {
                     })
                     .on_page_load(|webview, payload| {
                         if let PageLoadEvent::Finished = payload.event() {
-                            if webview.url().unwrap().as_str().contains(WECHAT_READER_URL) {
-                                if let Some(tab) = webview.app_handle().state::<AppGlobalState>().get_open_tabs_tab(webview.label()) {
-                                    let mode = tab.reader_mode;
-                                    let js_code = format!("update_wenda_style('{}');", mode);
-                                    webview.eval(&js_code).expect("js 方法update_wenda_style执行失败");
-                                    // log::info!("js 方法update_wenda_style 执行成功，mode:{}", mode);
+                            if let Ok(current_url) = webview.url() {
+                                let url_str = current_url.as_str();
+                                if url_str.contains(WECHAT_READER_URL) {
+                                    // 微信读书：恢复阅读宽度模式
+                                    if let Some(tab) = webview
+                                        .app_handle()
+                                        .state::<AppGlobalState>()
+                                        .get_open_tabs_tab(webview.label())
+                                    {
+                                        let mode = tab.reader_mode;
+                                        let js_code = format!("update_wenda_style('{}');", mode);
+                                        let _ = webview.eval(&js_code);
+                                    }
+                                } else if should_record_scroll(url_str) {
+                                    // 非微信读书网页：如果该 Tab 记录了滚动位置，则自动恢复
+                                    if let Some(tab) = webview
+                                        .app_handle()
+                                        .state::<AppGlobalState>()
+                                        .get_open_tabs_tab(webview.label())
+                                    {
+                                        if tab.scroll_top > 0.0 {
+                                            let selector_json =
+                                                serde_json::to_string(&tab.scroll_selector)
+                                                    .unwrap_or_else(|_| "\"\"".to_string());
+                                            let js_code = format!(
+                                                "if (typeof wenda_restore_scroll === 'function') {{ wenda_restore_scroll({}, {}); }}",
+                                                tab.scroll_top, selector_json
+                                            );
+                                            let _ = webview.eval(&js_code);
+                                        }
+                                    }
                                 }
                             }
 
@@ -622,30 +647,19 @@ pub fn run() {
 
             let registry = TaskRegistry::default();
 
-            // 异步写入历史访问记录
+            // 异步写入配置
             let task_write_config = tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 loop {
-                    let _app_store = tab_app_handle.state::<AppGlobalState>();
-                    let _file_path = _app_store.get_config_file_path();
-
-                    if _app_store.get_is_update() {
-                        let _tabs = _app_store.get_open_tabs();
-
-                        let _new_size = _app_store.get_window_size();
-
-                        let _side_position = _app_store.get_side_position();
-
-                        // 写入配置
-                        let store = tab_app_handle.store(_file_path).unwrap();
-                        store.set("historyTabs", json!(_tabs));
-                        store.set("windowSize", json!(_new_size));
-                        store.set("sidePosition", json!(_side_position));
-                        store.save().unwrap(); // 保存到硬盘
-
-                        log::info!("写入配置文件成功");
-                        _app_store.set_is_update(false);
+                    for i in 1..=MAX_TAB_COUNT {
+                        if let Some(webview) = tab_app_handle.get_webview(&get_tab_id(i)) {
+                            capture_webview_scroll(&webview);
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+
+                    flush_config_to_disk(&tab_app_handle);
+
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
             });
@@ -659,11 +673,15 @@ pub fn run() {
             // 开启纯 Rust 的后台异步轮询线程
             let task_window_position = tauri::async_runtime::spawn(async move {
                 loop {
-                    if !main_window.is_always_on_top().unwrap() {
-                        main_window.set_always_on_top(true).unwrap();
+                    match main_window.is_always_on_top() {
+                        Ok(false) => { let _ = main_window.set_always_on_top(true); }
+                        Err(_) => break,
+                        _ => {}
                     }
-                    if !side_window.is_always_on_top().unwrap() {
-                        side_window.set_always_on_top(true).unwrap();
+                    match side_window.is_always_on_top() {
+                        Ok(false) => { let _ = side_window.set_always_on_top(true); }
+                        Err(_) => break,
+                        _ => {}
                     }
 
                     let is_top = is_window_under_mouse(hwnd_main_raw, hwnd_side_raw);
@@ -696,7 +714,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_log::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![receive_front_top_action,receive_front_setting_action])
+        .invoke_handler(tauri::generate_handler![
+            receive_front_top_action,
+            receive_front_setting_action
+        ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app_handle, event| {
@@ -1129,6 +1150,10 @@ fn switch_webview(window: Window, mut close_tab_id: String, mut show_tab_id:Stri
     }
 
     if let Some(close_webview) = window.get_webview(&*close_tab_id) {
+        if !is_close_clear {
+            capture_webview_scroll(&close_webview);
+        }
+
         if is_close_clear {
             close_webview.navigate(BLANK_PAGE.parse().unwrap()).unwrap();
         }
@@ -1359,3 +1384,60 @@ fn set_side_position(side_window:&Window,side_position: SidePosition,screen_widt
 fn get_timestamp() -> i64 {
     Utc::now().timestamp_millis()
 }
+
+/// 立即将内存中的变更同步写入配置文件
+fn flush_config_to_disk(app_handle: &tauri::AppHandle) {
+    let app_store = app_handle.state::<AppGlobalState>();
+    if !app_store.get_is_update() {
+        return;
+    }
+
+    let file_path = app_store.get_config_file_path();
+    let tabs = app_store.get_open_tabs();
+    let new_size = app_store.get_window_size();
+    let side_position = app_store.get_side_position();
+
+    if let Ok(store) = app_handle.store(file_path) {
+        store.set("historyTabs", json!(tabs));
+        store.set("windowSize", json!(new_size));
+        store.set("sidePosition", json!(side_position));
+        if let Err(e) = store.save() {
+            log::error!("保存配置文件失败: {:?}", e);
+        } else {
+            log::info!("配置文件已成功保存到磁盘");
+            app_store.set_is_update(false);
+        }
+    }
+}
+
+/// 判断指定 URL 是否需要记录滚动条位置（排除微信读书、空白页及设置页）
+fn should_record_scroll(url: &str) -> bool {
+    let lower = url.trim().to_lowercase();
+    !lower.is_empty()
+        && lower != BLANK_PAGE
+        && !lower.contains(WECHAT_READER_DOMAIN)
+        && !lower.ends_with(SETTING_PAGE_URL)
+}
+
+/// 命令指定 Webview 立即上报当前滚动位置并更新到对应的 Tab 属性中
+fn capture_webview_scroll(webview: &Webview) {
+    if let Ok(url) = webview.url() {
+        if !should_record_scroll(url.as_str()) {
+            return;
+        }
+        let js_code = format!(
+            r#"(function() {{
+                if (typeof window.__wendaGetScrollState === 'function') {{
+                    const state = window.__wendaGetScrollState();
+                    const origTitle = document.title;
+                    document.title = "{}" + JSON.stringify(state);
+                    document.title = origTitle;
+                }}
+            }})();"#,
+            SCROLL_TITLE_PREFIX
+        );
+        let _ = webview.eval(&js_code);
+    }
+}
+
+

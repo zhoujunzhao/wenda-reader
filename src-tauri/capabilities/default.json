@@ -5,6 +5,12 @@
   "windows": [
     "main"
   ],
+  "remote": {
+    "urls": [
+      "https://*",
+      "http://*"
+    ]
+  },
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
