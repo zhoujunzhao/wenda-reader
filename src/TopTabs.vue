@@ -40,6 +40,15 @@
       <div class="address-container">
         <n-input v-model:value="activeUrl" placeholder="请输入网址" class="address-input" size="small" :disabled="addressDisabled" />
         <n-button size="small" @click="gotoNewUrl" :disabled="addressDisabled">Go</n-button>
+        <n-button
+            v-if="activeTabId === ID_FIRST_PAGE_ID"
+            size="small"
+            @click="goHome"
+            :disabled="isAtHome"
+            style="margin-left: 5px;"
+        >
+          回主页
+        </n-button>
       </div>
       <div class="style-container" v-show="widthModeShow">
         <n-radio
@@ -69,12 +78,13 @@
 </template>
 
 <script setup lang="ts">
-import {onMounted, onUnmounted, ref, watch} from "vue"
+import {computed, onMounted, onUnmounted, ref, watch} from "vue"
 import {listen} from "@tauri-apps/api/event";
 import {invoke} from "@tauri-apps/api/core";
 import { LineHorizontal320Regular } from '@vicons/fluent'
 
 const ID_FIRST_PAGE_ID: string = "tab-main";
+const ID_FIRST_PAGE_URL: string = "https://weread.qq.com/";
 
 interface Tab {
   id: string,
@@ -91,6 +101,20 @@ const addable = ref<boolean>(true);
 const addressDisabled = ref<boolean>(false);
 const widthValue = ref<string>("default");
 const widthModeShow = ref<boolean>(false);
+
+const isAtHome = computed(() => {
+  if (!activeUrl.value) return true;
+  return activeUrl.value.replace(/\/+$/, "") === ID_FIRST_PAGE_URL.replace(/\/+$/, "");
+});
+
+const goHome = () => {
+  activeUrl.value = ID_FIRST_PAGE_URL;
+  const tab = tabs.value.find(t => t.id === ID_FIRST_PAGE_ID);
+  if (tab) {
+    tab.url = ID_FIRST_PAGE_URL;
+  }
+  sendActionToBackend('goHome', {});
+};
 
 const onSettingClick = () => {
   sendActionToBackend('openSetting', { });

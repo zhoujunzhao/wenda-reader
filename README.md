@@ -22,9 +22,6 @@
 #### 开发测试运行
   bun run tauri dev  
 
-#### 还未考虑在 Android 上的运行
-  bun run tauri android dev  
-
 #### 为所有平台打包
   bun run tauri build  
 

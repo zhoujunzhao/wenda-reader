@@ -7,7 +7,7 @@ use std::str::FromStr;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Webview, WebviewUrl, Window, Wry, async_runtime::JoinHandle, RunEvent};
-use tauri::webview::PageLoadEvent;
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_store::{Store, StoreExt};
@@ -301,9 +301,10 @@ pub fn run() {
                 .build()?;
 
             // region 托盘
+            let open_cfg_i = MenuItem::with_id(app, "tray-open-config", "打开配置目录", true, None::<&str>).unwrap();
             let quit_i = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>).unwrap();
             // let show_i = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>).unwrap();
-            let menu = Menu::with_id_and_items(app, "tray-menu", &[&quit_i]).unwrap();
+            let menu = Menu::with_id_and_items(app, "tray-menu", &[&open_cfg_i,&quit_i]).unwrap();
             let _tray = TrayIconBuilder::new()
                 // 请确保你的 src-tauri/icons 目录下有对应的托盘图标（如 tray.png 或 icon.ico）
                 .icon(app.default_window_icon().unwrap().clone())
@@ -312,6 +313,22 @@ pub fn run() {
                 .tooltip(WINDOW_TITLE)
                 .on_menu_event(|app_handle, event| {
                     match event.id.as_ref() {
+                        "tray-open-config" => {
+                            let config_path = app_handle.state::<AppGlobalState>().get_config_file_path();
+                            let path = std::path::Path::new(&config_path);
+
+                            // 如果配置文件已存在，打开文件夹并高亮选中该文件；否则直接打开其所在目录
+                            if path.exists() {
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(format!("/select,{}", config_path))
+                                    .spawn();
+                            } else if let Some(parent_dir) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent_dir); // 确保目录存在
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(parent_dir)
+                                    .spawn();
+                            }
+                        }
                         "tray-quit" => {
                             if let Some(_) = app_handle.tray_by_id("tray-menu") {
                                 let _ = app_handle.remove_tray_by_id("tray-menu");
@@ -405,6 +422,7 @@ pub fn run() {
             )?;
 
             let _window = main_window.clone();
+            let _window2 = main_window.clone();
             main_window.add_child(
                 tauri::webview::WebviewBuilder::new(
                     ID_FIRST_PAGE_ID,
@@ -413,6 +431,7 @@ pub fn run() {
                 .devtools(true)
                 .auto_resize()
                 .on_navigation(move |url: &tauri::Url| {
+                    log::info!("on_navigation: {}", url);
                     let (state, tab_id) = is_open_new_tab(&_window, url.to_string());
                     return if state == 0 {
                         // 表示在当前webview打开
@@ -421,8 +440,7 @@ pub fn run() {
                         // 表示在新标签面打开，同时阻断当前webview打开
                         let tab = Tab::new("", "加载中", url.as_str(), true, "default");
                         add_tab(&_window, tab, false,false);
-                        let _win = _window.clone();
-                        send_is_tab_add(_win, -1);
+                        send_is_tab_add(&_window, -1);
                         false
                     } else if state == 2 {
                         // 表示激活已存在的标签，同时阻断当前webview打开
@@ -434,11 +452,24 @@ pub fn run() {
                     } else {
                         true
                     };
+                })
+                .on_new_window(move |new_url, _features| {
+                    log::info!("New window requested: {}", new_url);
+                    if let Some(web_view) = _window2.get_webview(ID_FIRST_PAGE_ID){
+                        web_view.navigate(new_url.clone()).unwrap();
+                        let payload = json!({
+                            "tabId": ID_FIRST_PAGE_ID,
+                            "url": new_url.as_str(),
+                        });
+                        send_action_to_top_view(&_window2, "modifyTabUrl", payload);
+                    }
+                    return NewWindowResponse::Deny;
                 }),
+
                 LogicalPosition::new(0.0, TOP_VIEW_HEIGHT),
                 LogicalSize::new(main_window_size.width,main_window_size.height - TOP_VIEW_HEIGHT),
             )?;
-
+            let _window = main_window.clone();
             for i in 1..=MAX_TAB_COUNT {
                 let _window = main_window.clone();
                 let webview_label = get_tab_id(i);
@@ -662,7 +693,6 @@ pub fn run() {
 
             Ok(())
         })
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_log::Builder::new().build())
@@ -759,7 +789,7 @@ fn add_tab(window: &Window, mut tab: Tab, is_show: bool,is_init:bool) {
 /// 判断标签页数量是否达到了最大值
 /// tabs_size: 标签页数量，当小于0时，方法会自己从全局状态中获取标签页数量
 /// 返回 true 表示未达到最大值，false 表示已达到或者超过最大值
-fn send_is_tab_add(window: Window,mut tabs_size:i32) {
+fn send_is_tab_add(window: &Window,mut tabs_size:i32) {
     if tabs_size < 0 {
         tabs_size = window.app_handle().state::<AppGlobalState>().get_open_tabs_count();
     }
@@ -835,8 +865,16 @@ fn receive_front_top_action(window: Window, action: String, data: serde_json::Va
         "openSetting" =>{
             do_open_setting(window);
         }
-
+        "goHome" => {
+            do_go_home(window);
+        }
         _ => {}
+    }
+}
+
+fn do_go_home(window: Window) {
+    if let Some(web_view) = window.get_webview(ID_FIRST_PAGE_ID) {
+        let _ = web_view.navigate(ID_FIRST_PAGE_URL.parse().unwrap());
     }
 }
 
@@ -887,7 +925,7 @@ fn get_all_route_url(window: Window, sub_url: &str) -> String {
 fn do_add_void_tab(window: Window) {
     let tabs_size = window.app_handle().state::<AppGlobalState>().get_open_tabs_count();
     if tabs_size >= MAX_TAB_COUNT as i32 {
-        send_is_tab_add(window.clone(), tabs_size);
+        send_is_tab_add(&window, tabs_size);
         alert_show(window, "提示", "标签页数量达到最大值，无法添加新标签页");
         return;
     }
@@ -897,7 +935,7 @@ fn do_add_void_tab(window: Window) {
         return;
     }
     add_tab(&window, Tab::new(&*tab_id, "新页", BLANK_PAGE, true, ""), true, false);
-    send_is_tab_add(window.clone(), -1);
+    send_is_tab_add(&window, -1);
 }
 
 fn do_open_new_url(window: Window,tab_id:String, url: String) {
@@ -946,8 +984,7 @@ fn do_ready_notify(window: Window) {
                 list.push(val.clone().url);
                 i += 1;
             }
-            let _win = window.clone();
-            send_is_tab_add(_win, -1);
+            send_is_tab_add(&window, -1);
         }
 
     });
@@ -995,8 +1032,7 @@ fn do_tab_closed(window: Window, close_tab_id: String, active_tab_id: String) {
     tauri::async_runtime::spawn(async move {
         let app_store = window.app_handle().state::<AppGlobalState>();
         app_store.set_open_tabs_remove(&close_tab_id);
-        let _win = window.clone();
-        send_is_tab_add(_win, -1);
+        send_is_tab_add(&window, -1);
     });
 }
 
