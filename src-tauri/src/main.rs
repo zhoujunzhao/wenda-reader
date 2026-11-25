@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    wx_reader_lib::run()
+    wenda_reader_lib::run()
 }
